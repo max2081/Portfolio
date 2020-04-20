@@ -1,0 +1,31 @@
+drop table INSTRUCTOR;
+
+create table INSTRUCTOR
+	(Ins_id int not null constraint INSTRUCTOR_PK primary key,
+	lastname varchar(15) not null,
+	firstname varchar(15) not null,
+	city varchar(15),
+	country char(2)
+	);
+
+insert into INSTRUCTOR
+	(Ins_id, lastname, firstname, city, country)
+	values(1, 'Ahuja', 'Rav', 'Toronto', 'CA');
+
+insert into INSTRUCTOR
+	(Ins_id, lastname, firstname, city, country)
+	values(2, 'Chong', 'Raul', 'Toronto', 'CA'), (3, 'Vasudavan', 'Hima', 'Chicago', 'US');
+	
+select * from INSTRUCTOR;
+
+select firstname, lastname, country from INSTRUCTOR
+	where city = 'Toronto';
+	
+update INSTRUCTOR
+set city='Markham'
+	where firstname='Rav';
+
+delete from INSTRUCTOR
+	where firstname='Raul';
+
+select * from INSTRUCTOR;
