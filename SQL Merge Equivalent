@@ -1,0 +1,101 @@
+#### ok this was super complicated so bear with
+#### the aim of this code is to create a historic version of subscription_plans_v2, as subscription_plans_v2 overwirtes itself when updated. 
+#### the problem was that we needed to create a new version of subscription_plans_v2 which updated with a new row if a change was made
+#### this is done by comparing subscription_plans_v2 with an older version of itself to create a new version combining the two
+#### Once you created the new version with the additional rows, that became the old version you compare subscription_plans_v2 with
+#### BUT with the addition of the new (up to date) rows, the old rows in the "original version" would be highlighted as different, 
+#### thus causing them to be copied in again and again.
+
+#### in order to not copy those again we needed to create a holding table which had all the changes so far.
+#### we could then compare the new changes with changes so far and thus find all changes which needed to be added, while ignoring already included changes.
+#### I hope that makes sense.....
+
+
+
+#### first lets add any new rows (which aren't changed previously existing rows) to the historic table
+### We do this by joining the historic table to the current subscription_plans_v2. 
+drop temporary table if exists new_subs;
+create temporary table new_subs
+select
+		upd.ccm_plan_id, upd.Patient_No, upd.First_Subscription_Order_ID, upd.Payment_Order_ID, upd.start_date, 
+		upd.plan_id, upd.plan_name, upd.status, upd.last_updated_date,
+        his.ccm_plan_id as hi1, his.Patient_No as hi2, his.First_Subscription_Order_ID as hi3, his.Payment_Order_ID as hi4, his.start_date as hi5, 
+		his.plan_id as hi6, his.plan_name as hi7, his.status as hi8, his.last_updated_date as hi9
+from subscription_plans_v2 upd
+left join subscription_plans_historic his on upd.patient_no = his.patient_no
+and upd.ccm_plan_id = his.ccm_plan_id
+;
+
+#### any rows where the orginal table comes up as null, are new rows. So those are isolated
+drop temporary table if exists new_subs2;
+create temporary table new_subs2
+select ccm_plan_id, Patient_No, First_Subscription_Order_ID, Payment_Order_ID, 
+start_date, plan_id, plan_name, status, last_updated_date 
+from new_subs 
+where hi1 is null
+;
+#### They are then inserted into historic
+insert into subscription_plans_historic (ccm_plan_id, Patient_No, First_Subscription_Order_ID, Payment_Order_ID, 
+										start_date, plan_id, plan_name, status, last_updated_date)
+select upd.ccm_plan_id, upd.Patient_No, upd.First_Subscription_Order_ID, upd.Payment_Order_ID, upd.start_date, 
+		upd.plan_id, upd.plan_name, upd.status, upd.last_updated_date
+from new_subs2 upd;
+
+##### now we compare historic with subscription_plans_v2 to see if any rows have been overwritten
+#### Union pulls the two table together. If a row is a duplicate it only pulls in the one. 
+#### if a row has been updated it pulls in both.
+
+drop temporary table if exists historic_update;
+create temporary table historic_update
+select * 
+from subscription_plans_historic
+union
+select sub.*
+from subscription_plans_v2 sub
+order by last_updated_date desc;
+
+#### we identify the updates by seeing if ccm_plan_id occures more than once (ignoring 4826 as it has a duplicate error) and isolate those rows
+drop temporary table if exists update_duplicates;
+create temporary table update_duplicates
+SELECT *, COUNT(ccm_plan_id) as duplicates
+FROM historic_update
+where ccm_plan_id not in (4826)
+GROUP BY ccm_plan_id
+HAVING COUNT(ccm_plan_id) > 1;
+
+#### similar to the above technique, we join the updated rows with a table containing all updates since the beginning of historic data being taken
+#### any rows which match have already been added to the historic, any rows which dont match are newly updated and need to be added.
+drop temporary table if exists update_duplicates2;
+create temporary table update_duplicates2
+select
+		upd.ccm_plan_id, upd.Patient_No, upd.First_Subscription_Order_ID, upd.Payment_Order_ID, upd.start_date, 
+		upd.plan_id, upd.plan_name, upd.status, upd.last_updated_date,
+        his.ccm_plan_id as hi1, his.Patient_No as hi2, his.First_Subscription_Order_ID as hi3, his.Payment_Order_ID as hi4, his.start_date as hi5, 
+		his.plan_id as hi6, his.plan_name as hi7, his.status as hi8, his.last_updated_date as hi9
+from update_duplicates upd
+left join subscription_plans_historic_holding his on upd.patient_no = his.patient_no
+and upd.ccm_plan_id = his.ccm_plan_id
+;
+#### we isolate the new rows
+drop temporary table if exists update_duplicates3;
+create temporary table update_duplicates3
+select ccm_plan_id, Patient_No, First_Subscription_Order_ID, Payment_Order_ID, 
+	start_date, plan_id, plan_name, status, last_updated_date 
+from update_duplicates2
+where hi1 is null
+;
+##### and insert them into the historic and the holding (thus updating the record of all changes which have been made, and stopping those rows being added again next time
+insert into subscription_plans_historic_holding (ccm_plan_id, Patient_No, First_Subscription_Order_ID, Payment_Order_ID, 
+										start_date, plan_id, plan_name, status, last_updated_date)
+select upd.ccm_plan_id, upd.Patient_No, upd.First_Subscription_Order_ID, upd.Payment_Order_ID, upd.start_date, 
+		upd.plan_id, upd.plan_name, upd.status, upd.last_updated_date
+from update_duplicates3 upd;
+
+insert into subscription_plans_historic (ccm_plan_id, Patient_No, First_Subscription_Order_ID, Payment_Order_ID, 
+										start_date, plan_id, plan_name, status, last_updated_date)
+select upd.ccm_plan_id, upd.Patient_No, upd.First_Subscription_Order_ID, upd.Payment_Order_ID, upd.start_date, 
+		upd.plan_id, upd.plan_name, upd.status, upd.last_updated_date
+from update_duplicates3 upd;
+
+
+##### Done!
