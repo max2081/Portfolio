@@ -1,0 +1,321 @@
+import snowflake.connector
+import pandas as pd
+import matplotlib.pyplot as plt
+%matplotlib inline
+import numpy as np
+import seaborn as sns
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler,PolynomialFeatures
+from sklearn.linear_model import LinearRegression
+import statsmodels.api as sm
+from itertools import product
+import getpass
+pd.set_option('display.max_columns', None)
+# pd.set_option('display.max_rows', None)
+pd.options.display.float_format = '{:.5f}'.format
+
+pwd = getpass.getpass("enter password")
+
+cnn = snowflake.connector.connect(user='********',
+                                  password=str(pwd),
+                                  account='***********',
+                                  region='************',
+                                  warehouse='************',
+                                  database='************',
+                                  schema='************')
+
+cs = cnn.cursor()
+
+
+sql = ('''
+
+WITH DAY_0_TABLE AS (
+SELECT FP.CUSTOMER_ID, 
+        FP.LAUNDRY, FP.BIO, FP.N_BIO, FP.FF, FP.DW, FP.SPRAY, FP.BUNDLE, FP.FABCON, FP.HANDSAN, FP.WUL, 
+        FREE_TRIAL_PRODUCT, PAID_PRODUCT,
+        SUB_COUNT_ON_CHECKOUT, SUB_COUNT_ON_FIRST_DAY,
+        PAID_FIRST_BASKET, PAID_FIRST_DAY, NO_PAY,
+        PAYMENT_FAILED_AT_CHECKOUT,
+        -- VISA, MASTERCARD, AMEX,
+        -- JOIN_MONTH, JOIN_YEAR,
+        CASE WHEN (PAID_FIRST_BASKET = 0 AND PAID_FIRST_DAY = 1) 
+          OR (SUB_COUNT_ON_CHECKOUT < SUB_COUNT_ON_FIRST_DAY) 
+        THEN 1 ELSE 0 END AS PORTAL_INTERACTION,
+        CASE WHEN (PAID_FIRST_BASKET = 0 AND PAID_FIRST_DAY = 1) 
+          OR (SUB_COUNT_ON_CHECKOUT < SUB_COUNT_ON_FIRST_DAY) 
+        THEN 0 ELSE 1 END AS NO_PORTAL_INTERACTION,
+        SPEND_FIRST_BASKET, SPEND_FIRST_DAY,
+        WEEKEND, WEEKDAY,
+        FIRST_QUARTER_DAY, SECOND_QUARTER_DAY, THIRD_QUARTER_DAY, FORTH_QUARTER_DAY,
+        TOTAL_ANNUAL_INCOME,
+        NTILE(4) OVER(ORDER BY I.TOTAL_ANNUAL_INCOME ASC) AS INCOME_QUARTILE,
+        CASE WHEN INCOME_QUARTILE = 1 THEN 1 ELSE 0 END AS INCOME_FIRST_QUARTILE,
+        CASE WHEN INCOME_QUARTILE = 2 THEN 1 ELSE 0 END AS INCOME_SECOND_QUARTILE,
+        CASE WHEN INCOME_QUARTILE = 3 THEN 1 ELSE 0 END AS INCOME_THIRD_QUARTILE,
+        CASE WHEN INCOME_QUARTILE = 4 THEN 1 ELSE 0 END AS INCOME_FORTH_QUARTILE,
+        GENDER_MALE, GENDER_FEMALE, GENDER_UNKNOW,
+        GENDER_FOUND, GENDER_NOT_FOUND,
+        FACEBOOK, PARTNERSHIPS, INFLUENCERS, ORGANIC, EMAIL, REDDIT, TIKTOK, GOOGLE, CUSTOMER_REFERRALS, OTHER_PAID_CHANNELS,
+        PROMO_CODE
+FROM FIRST_PROD FP
+LEFT JOIN FIRST_SUBS_COUNT FSC ON FP.CUSTOMER_ID = FSC.CUSTOMER_ID
+)
+
+, RETENTION_RAW AS(
+SELECT
+C.CUSTOMER_ID AS ID,
+TIMESTAMPDIFF(DAY,ACTIVE_FROM, ACTIVE_TO) AS DAYS_TO_CANCEL,
+TIMESTAMPDIFF(DAY,ACTIVE_FROM,CURRENT_DATE()) AS DAYS_SINCE_JOIN
+FROM
+"DBT_MODELS"."CUSTOMER" C
+WHERE YEAR(CREATED_AT) >= 2018
+AND LATEST_CHARGE_PROCESSED IS NOT NULL
+AND ACTIVE_FROM IS NOT NULL
+AND DATA_SOURCE = 'UK'
+)
+
+, NUMBER_ARRAY AS (
+SELECT
+SEQ4() as SEQUENCE
+FROM
+TABLE(GENERATOR(ROWCOUNT => 3650)) 
+WHERE
+MOD(SEQUENCE,1) = 0 
+)
+
+,RETENTION_DETAIL AS
+(
+SELECT
+NA.SEQUENCE AS DAYS_SINCE_JOIN,
+COUNT(DISTINCT CASE WHEN IFNULL(RR.DAYS_TO_CANCEL,100000) >= NA.SEQUENCE AND RR.DAYS_SINCE_JOIN >= NA.SEQUENCE THEN RR.ID ELSE NULL END) AS ACTIVE_CUSTOMERS,
+COUNT(DISTINCT CASE WHEN RR.DAYS_SINCE_JOIN >= NA.SEQUENCE THEN RR.ID ELSE NULL END) AS POSSIBLE_CUSTOMERS,
+CASE WHEN POSSIBLE_CUSTOMERS IS NULL OR POSSIBLE_CUSTOMERS = 0 THEN NULL ELSE ACTIVE_CUSTOMERS/POSSIBLE_CUSTOMERS END AS RETENTION_RATE
+FROM NUMBER_ARRAY NA
+LEFT JOIN RETENTION_RAW RR
+GROUP BY 1--, 2
+HAVING POSSIBLE_CUSTOMERS >= 30 
+)
+
+, BESTFIT AS (
+SELECT NA.SEQUENCE AS DAYS_SINCE_JOIN, RETENTION_RATE, 
+        -- (0.689-(0.000428*NA.SEQUENCE)+(0.0000000597*(SQUARE(NA.SEQUENCE)))) AS BEST_FIT
+        0.717*EXP(-0.000792*NA.SEQUENCE) AS BEST_FIT
+FROM NUMBER_ARRAY NA
+LEFT JOIN RETENTION_DETAIL RD ON NA.SEQUENCE = RD.DAYS_SINCE_JOIN
+)
+
+, COMBINED AS (
+SELECT DAYS_SINCE_JOIN,
+        CASE WHEN DAYS_SINCE_JOIN < (600) THEN RETENTION_RATE ELSE BEST_FIT 
+        END AS COMBINED_CURVE
+FROM BESTFIT
+)
+
+,COMBINED_LIMIT1 AS (
+SELECT DAYS_SINCE_JOIN,
+        CASE WHEN DAYS_SINCE_JOIN < ROUND((7 * 365.25), 0) THEN COMBINED_CURVE
+              ELSE 0
+        END AS COMBINED_CURVE_LIMIT
+FROM COMBINED
+)
+
+, COMBINED_LIMIT AS (
+SELECT DAYS_SINCE_JOIN,
+        CASE WHEN COMBINED_CURVE_LIMIT <= 0 THEN 0 ELSE COMBINED_CURVE_LIMIT END AS COMBINED_CURVE_POS
+FROM COMBINED_LIMIT1
+)
+
+, DIFF AS (
+SELECT DAYS_SINCE_JOIN, COMBINED_CURVE_POS,
+        CASE WHEN DAYS_SINCE_JOIN = 0 THEN 0 
+              ELSE ((COALESCE(LAG(COMBINED_CURVE_POS) OVER (ORDER BY DAYS_SINCE_JOIN), 0)) - COMBINED_CURVE_POS) 
+        END AS DIFF1
+FROM COMBINED_LIMIT
+)
+
+, DIFFERENCE AS (
+SELECT DAYS_SINCE_JOIN, COMBINED_CURVE_POS,
+        CASE WHEN DIFF1 < 0 THEN 0 ELSE DIFF1 END AS DIFF
+FROM DIFF
+)
+
+, REMAINING_DAYS AS (
+SELECT D.DAYS_SINCE_JOIN, DIFF,
+        SUM(D.DAYS_SINCE_JOIN * DIFF) OVER (ORDER BY D.DAYS_SINCE_JOIN DESC) AS SUM_PRODUCT,
+        ROUND(
+              DIV0(
+                    SUM(D.DAYS_SINCE_JOIN * DIFF) OVER (ORDER BY D.DAYS_SINCE_JOIN DESC)
+                    ,
+                    SUM(DIFF) OVER (ORDER BY D.DAYS_SINCE_JOIN DESC)),0) 
+        AS LIFE_EXPECTANCY,
+        ROUND(
+              (DIV0(
+                    SUM(D.DAYS_SINCE_JOIN * DIFF) OVER (ORDER BY D.DAYS_SINCE_JOIN DESC)
+                    ,
+                    SUM(DIFF) OVER (ORDER BY D.DAYS_SINCE_JOIN DESC))) 
+              - D.DAYS_SINCE_JOIN ,0) 
+        AS REMAINING_LIFE_EXPECTANCY
+FROM DIFFERENCE D
+)
+
+, CUSTOMER_LTR AS (
+SELECT PD.CUSTOMER_ID, CASE WHEN PD.ACTIVE_SUBSCRIPTION_COUNT >= 1 THEN 'ACTIVE' ELSE 'CANCELLED' END AS STATUS,
+        ROUND(CASE WHEN STATUS = 'CANCELLED' THEN TOTAL_PRICE 
+                    WHEN CUSTOMER_DURATION_DAYS >= ROUND((7 * 365.25), 0) THEN TOTAL_PRICE
+                    ELSE ((REMAINING_LIFE_EXPECTANCY/30.4) * SPM.SPEND_PER_MONTH) + PD.TOTAL_PRICE
+        END, 2) AS LTR
+FROM PRICE_DISCOUNT PD
+LEFT JOIN SPEND_PER_MONTH SPM ON PD.CUSTOMER_ID = SPM.CUSTOMER_ID
+LEFT JOIN RETENTION_DETAIL RD ON PD.CUSTOMER_DURATION_DAYS = RD.DAYS_SINCE_JOIN
+LEFT JOIN REMAINING_DAYS RDS ON PD.CUSTOMER_DURATION_DAYS = RDS.DAYS_SINCE_JOIN
+LEFT JOIN RETENTION_AT_30_DAYS RTD ON PD.CUSTOMER_ID = RTD.CUSTOMER_ID
+)
+
+SELECT LTR, DT.*
+FROM CUSTOMER_LTR AS LTR
+INNER JOIN DAY_0_TABLE AS DT ON LTR.CUSTOMER_ID = DT.CUSTOMER_ID
+
+''')
+
+
+cs.execute(sql)
+df = cs.fetch_pandas_all()
+cs.close()
+cnn.close()
+df.head(10)
+
+
+df.describe().apply(lambda s: s.apply('{0:.0f}'.format))
+
+
+
+X = df[["LAUNDRY","SPRAY",
+        "GENDER_FEMALE","WEEKEND",
+        "INCOME_QUARTILE",
+        "FACEBOOK","PARTNERSHIPS",
+        "SUB_COUNT_ON_CHECKOUT","SPEND_FIRST_BASKET"]]
+
+Y = df['LTR']
+
+# Adding a constant column to the features matrix (for intercept)
+X_with_intercept = sm.add_constant(X)
+
+# Fitting a multivariate linear regression model
+model = sm.OLS(Y, X_with_intercept).fit()
+
+# Getting the summary of the model
+model_summary = model.summary()
+
+# Extracting coefficients
+coefficients = model.params
+
+# Creating a table to show the impact of each variate on LTV
+impact_table = pd.DataFrame({
+    'Variate': ['Intercept'] + list(X.columns),
+    'Coefficient': coefficients.values,
+    'Absolute': coefficients.values.__abs__(),
+    'Percent': [0] + list((X.sum() /len(df. index)))
+})
+
+# Displaying the impact table and model summary
+print("Impact Table:")
+print(impact_table)
+print("\nModel Summary:")
+print(model_summary)
+
+
+
+
+
+
+X = df[["LAUNDRY","SPRAY",
+        "GENDER_FEMALE","WEEKEND",
+        "INCOME_QUARTILE",
+        "FACEBOOK","PARTNERSHIPS",
+        "SUB_COUNT_ON_CHECKOUT","SPEND_FIRST_BASKET"]]
+
+Y = df['LTR']
+
+# Adding a constant column to the features matrix (for intercept)
+X_with_intercept = sm.add_constant(X)
+
+# Fitting a multivariate linear regression model
+model = sm.OLS(Y, X_with_intercept).fit()
+
+# Getting the summary of the model
+model_summary = model.summary()
+
+# Extracting coefficients
+coefficients = model.params
+
+# Creating a table to show the impact of each variate on LTV
+impact_table = pd.DataFrame({
+    'Variate': ['Intercept'] + list(X.columns),
+    'Coefficient': coefficients.values,
+    'Absolute': coefficients.values.__abs__(),
+    'Percent': [0] + list((X.sum() /len(df. index)))
+})
+
+# Displaying the impact table and model summary
+print("Impact Table:")
+print(impact_table)
+print("\nModel Summary:")
+print(model_summary)
+
+
+
+
+# def create_dict_from_dataframe(dataframe):
+    
+#     column_dict = {}
+#     for column in dataframe.columns:
+#         column_dict[column] = dataframe[column].unique().tolist()
+#     return column_dict
+
+# grouped_dict = create_dict_from_dataframe(X)
+# print(grouped_dict)
+
+
+
+
+# spend = [0,10,20,30,40,50,60]
+# grouped_dict.pop('SPEND_FIRST_BASKET', None)
+# grouped_dict['SPEND_FIRST_BASKET'] = spend
+# print(grouped_dict)
+
+
+
+
+# combinations = list(product(*grouped_dict.values()))
+# df_unique = pd.DataFrame(combinations, columns=grouped_dict.keys())
+# df_unique
+
+
+
+
+def prediction(dframe, coefficients, intercept):
+    results = []
+
+    for _, row in dframe.iterrows():
+
+        row_sum = intercept
+
+        for col_name, coefficient in coefficients.items():
+            row_sum += row[col_name] * coefficient
+
+        results.append(row_sum)
+
+    dframe['Prediction'] = results
+
+    return dframe
+
+intercept = coefficients.values[0]
+
+result = prediction(df_unique, variables, intercept)
+result.sort_values(by=['Prediction'])
+
+
+
+
+# sns.boxplot(data=result, x="SPEND_FIRST_BASKET", y="Prediction")
+
